@@ -14,8 +14,14 @@
 #include <linux/mm.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#ifdef CONFIG_XEN
 #include <xen/xen.h>
 #include <asm/xen/hypercall.h>
+#endif
+#ifdef CONFIG_SEV
+#include <asm/svm.h>
+#include <asm/sev.h>
+#endif
 #include <asm/pgtable_types.h>
 #include <asm/pgtable_64.h>
 #include "modxom.h"
@@ -71,6 +77,17 @@ static bool were_pages_locked(pxom_mapping mapping) {
     return ret > 0;
 }
 
+// Simulate Xen hypercall
+static int hypercall(struct mmuext_op *op, int nr_ents, int domid, void *gfns) {
+    #ifdef CONFIG_XEN
+    return HYPERVISOR_mmuext_op(op, nr_ents, gfns, domid);
+    #elif CONFIG_SEV
+    return 0;
+    #else
+    return 0;
+    #endif
+}
+
 // Add or remove hypervisor protection
 static int
 xom_invoke_xen(pxom_mapping mapping, unsigned int page_index, unsigned int num_pages, unsigned int mmuext_cmd) {
@@ -109,7 +126,7 @@ xom_invoke_xen(pxom_mapping mapping, unsigned int page_index, unsigned int num_p
 #ifdef MODXOM_DEBUG
         printk(KERN_INFO "[MODXOM] Invoking Hypervisor with mfn 0x%lx for %u pages\n", op.arg1.mfn, op.arg2.nr_ents);
 #endif
-        status = HYPERVISOR_mmuext_op(&op, 1, NULL, DOMID_SELF);
+        status = hypercall(&op, 1, NULL, DOMID_SELF);
         if (status) {
 #ifdef MODXOM_DEBUG
             printk(KERN_INFO "[MODXOM] Failed - Status 0x%x\n", status);
@@ -421,7 +438,7 @@ static int xom_subpage_write_xen(pmodxom_cmd cmd) {
 #ifdef MODXOM_DEBUG
         printk(KERN_INFO "[MODXOM] Invoking hypervisor with dest_mfn 0x%lx and src_mfn 0x%lx\n", op.arg1.mfn, op.arg2.src_mfn);
 #endif
-        status = HYPERVISOR_mmuext_op(&op, 1, NULL, DOMID_SELF);
+        status = hypercall(&op, 1, NULL, DOMID_SELF);
         if (status) {
 #ifdef MODXOM_DEBUG
             printk(KERN_INFO "[MODXOM] Failed - Status 0x%x\n", status);
@@ -506,7 +523,7 @@ static int xom_forward_to_hypervisor(uint64_t base_addr, unsigned int mmuext_t_c
 #ifdef MODXOM_DEBUG
         printk(KERN_INFO "[MODXOM] Invoking mmuext_op with dest_mfn 0x%lx\n", op.arg1.mfn);
 #endif
-        status = HYPERVISOR_mmuext_op(&op, 1, NULL, DOMID_SELF);
+        status = hypercall(&op, 1, NULL, DOMID_SELF);
         if (status) {
 #ifdef MODXOM_DEBUG
             printk(KERN_INFO "[MODXOM] Failed - Status 0x%x\n", status);
