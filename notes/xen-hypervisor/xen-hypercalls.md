@@ -11,6 +11,8 @@
 
 **Hypercall** 是 Guest 操作系统调用 Xen Hypervisor 服务的接口，类似于系统调用（syscall）。Guest 通过 hypercall 请求 Hypervisor 执行特权操作，如内存管理、调度、事件通道等。
 
+**重要设计模式**: Xen 的 hypercall 基于 **GFN (Guest Frame Number)**，所有指向 guest 内存的指针都是基于 GFN 的。这种设计与 AMD SEV-ES 的 GHCB 协议类似，都是在物理页中存放客户请求。详见 [Hypercall 基于 GFN 的设计模式](./hypercall-gfn-design.md)。
+
 ## 一、Hypercall 基础
 
 ### 1.1 什么是 Hypercall？
@@ -808,9 +810,371 @@ paging_domctl_cont                 do       do       do       do       -
 **仅 ARM**:
 - ARM 使用硬件虚拟化，不需要很多 PV 特定的 hypercall
 
-## 六、Hypercall 调用流程
+## 六、Hypercall 权限分类
 
-### 6.1 Guest 调用流程
+### 6.1 Domain 0 专用（特权）Hypercall
+
+以下 hypercall **通常只有 Domain 0（特权域）可以使用**，用于系统管理和控制：
+
+#### 6.1.1 系统管理类
+
+**`HYPERVISOR_sysctl`** - 系统控制
+- **用途**: 系统级控制操作
+- **权限**: 需要特权域（Domain 0）
+- **功能**:
+  - 读取控制台
+  - 获取系统信息
+  - 调度器管理
+  - 性能监控
+  - 系统配置
+- **实现**: `xen/xen/common/sysctl.c` - `do_sysctl()`
+- **权限检查**: 通过 XSM (`xsm_sysctl()`) 检查权限
+
+**`HYPERVISOR_domctl`** - Domain 控制
+- **用途**: Domain 级管理操作
+- **权限**: 需要特权域（Domain 0）
+- **功能**:
+  - 创建、销毁 Domain
+  - 暂停、恢复 Domain
+  - 设置 Domain 参数（内存、VCPU 等）
+  - 迁移 Domain
+  - 获取 Domain 信息
+- **实现**: `xen/xen/common/domctl.c` - `do_domctl()`
+- **说明**: 这是 Domain 0 管理其他 Domain 的主要接口
+
+#### 6.1.2 硬件访问类
+
+**`HYPERVISOR_physdev_op`** - 物理设备操作（部分操作）
+- **用途**: 物理设备管理
+- **权限**: 部分操作需要硬件域（hardware domain，通常是 Domain 0）
+- **需要硬件域的操作**:
+  - `PHYSDEVOP_pci_device_add` - 添加 PCI 设备
+  - `PHYSDEVOP_pci_device_remove` - 移除 PCI 设备
+  - `PHYSDEVOP_pci_mmcfg_reserved` - PCI MMCONFIG 保留
+  - `PHYSDEVOP_dbgp_op` - 调试端口操作
+- **实现**: `xen/xen/arch/x86/physdev.c` - `do_physdev_op()`
+- **权限检查**:
+```68:100:xen/xen/arch/x86/hvm/hypercall.c
+long hvm_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+{
+    const struct vcpu *curr = current;
+    const struct domain *currd = curr->domain;
+
+    switch ( cmd )
+    {
+    case PHYSDEVOP_map_pirq:
+    case PHYSDEVOP_unmap_pirq:
+    case PHYSDEVOP_eoi:
+    case PHYSDEVOP_irq_status_query:
+    case PHYSDEVOP_get_free_pirq:
+        if ( !has_pirq(currd) )
+            return -ENOSYS;
+        break;
+
+    case PHYSDEVOP_pci_mmcfg_reserved:
+    case PHYSDEVOP_pci_device_add:
+    case PHYSDEVOP_pci_device_remove:
+    case PHYSDEVOP_dbgp_op:
+        if ( !is_hardware_domain(currd) )
+            return -ENOSYS;
+        break;
+
+    default:
+        return -ENOSYS;
+    }
+
+    if ( !curr->hcall_compat )
+        return do_physdev_op(cmd, arg);
+    else
+        return compat_physdev_op(cmd, arg);
+}
+```
+
+**`HYPERVISOR_platform_op`** - 平台操作（部分操作）
+- **用途**: 平台特定操作
+- **权限**: 部分操作需要特权域
+- **需要特权的操作**:
+  - 设置系统时间
+  - 访问 MSR
+  - 其他平台特定配置
+
+### 6.2 Domain U 可以使用（非特权）Hypercall
+
+以下 hypercall **普通 Domain（Domain U）可以使用**，用于自身运行和管理：
+
+#### 6.2.1 内存管理类
+
+**`HYPERVISOR_memory_op`** - 内存操作
+- **用途**: Guest 内存管理
+- **权限**: 大部分操作 Domain U 可以使用
+- **Domain U 可用操作**:
+  - `XENMEM_increase_reservation` - 增加内存预留
+  - `XENMEM_decrease_reservation` - 减少内存预留
+  - `XENMEM_populate_physmap` - 填充物理映射
+  - `XENMEM_add_to_physmap` - 添加到物理映射
+  - `XENMEM_remove_from_physmap` - 从物理映射移除
+  - `XENMEM_exchange` - 交换内存页
+  - `XENMEM_maximum_ram_page` - 获取最大 RAM 页号
+  - `XENMEM_current_reservation` - 获取当前预留
+  - `XENMEM_maximum_reservation` - 获取最大预留
+  - `XENMEM_machphys_mfn_list` - 获取机器物理页列表
+  - `XENMEM_reserved` - 保留内存
+  - `XENMEM_memory_map` - 内存映射（仅 PV）
+  - `XENMEM_set_memory_map` - 设置内存映射（仅 PV）
+  - `XENMEM_add_to_physmap_batch` - 批量添加到物理映射
+  - `XENMEM_pin_page_range` - 固定页范围
+  - `XENMEM_unpin_page_range` - 取消固定页范围
+  - `XENMEM_get_sharing_freed_pages` - 获取共享释放页
+  - `XENMEM_get_sharing_shared_pages` - 获取共享页
+  - `XENMEM_paging_op` - 分页操作
+  - `XENMEM_access_op` - 访问操作
+  - `XENMEM_claim_pages` - 声明页
+  - `XENMEM_get_vnumainfo` - 获取虚拟 NUMA 信息
+  - `XENMEM_set_vnumainfo` - 设置虚拟 NUMA 信息
+- **受限操作**（需要特权）:
+  - `XENMEM_machine_memory_map` - 机器内存映射（仅 Domain 0）
+  - `XENMEM_machphys_mapping` - 机器物理映射（仅 Domain 0）
+
+#### 6.2.2 通信类
+
+**`HYPERVISOR_grant_table_op`** - Grant Table 操作
+- **用途**: 内存共享和授权
+- **权限**: Domain U 可以使用
+- **功能**:
+  - 设置 Grant Table
+  - 授权内存页给其他 Domain
+  - 映射其他 Domain 授权的内存页
+  - 取消授权和映射
+- **实现**: `xen/xen/common/grant_table.c` - `do_grant_table_op()`
+
+**`HYPERVISOR_event_channel_op`** - 事件通道操作
+- **用途**: 域间事件通信
+- **权限**: Domain U 可以使用
+- **功能**:
+  - 分配事件通道
+  - 绑定事件通道
+  - 发送事件
+  - 关闭事件通道
+- **实现**: `xen/xen/common/event_channel.c` - `do_event_channel_op()`
+
+**`HYPERVISOR_argo_op`** - Argo 域间通信
+- **用途**: Argo 域间通信协议
+- **权限**: Domain U 可以使用（需要策略允许）
+- **功能**:
+  - 发送消息到其他 Domain
+  - 接收来自其他 Domain 的消息
+  - 管理通信环
+- **实现**: `xen/xen/common/argo.c` - `do_argo_op()`
+
+**`HYPERVISOR_console_io`** - 控制台 I/O
+- **用途**: 控制台输入/输出
+- **权限**: Domain U 可以使用
+- **功能**:
+  - 读取控制台
+  - 写入控制台
+- **实现**: `xen/xen/common/console.c` - `do_console_io()`
+
+#### 6.2.3 调度和 VCPU 类
+
+**`HYPERVISOR_sched_op`** - 调度操作
+- **用途**: CPU 调度控制
+- **权限**: Domain U 可以使用
+- **功能**:
+  - 阻塞当前 VCPU
+  - 让出 CPU
+  - 设置调度参数
+  - 获取调度信息
+- **实现**: `xen/xen/common/sched/core.c` - `do_sched_op()`
+
+**`HYPERVISOR_set_timer_op`** - 设置定时器
+- **用途**: 设置 VCPU 定时器
+- **权限**: Domain U 可以使用
+- **功能**: 设置 VCPU 唤醒时间
+- **实现**: `xen/xen/arch/x86/time.c` - `do_set_timer()`
+
+**`HYPERVISOR_vcpu_op`** - VCPU 操作（部分操作）
+- **用途**: VCPU 管理
+- **权限**: 部分操作 Domain U 可以使用，部分需要特权
+- **Domain U 可用操作**:
+  - `VCPUOP_register_vcpu_info` - 注册 VCPU 信息
+  - `VCPUOP_register_runstate_memory_area` - 注册运行状态内存区域
+  - `VCPUOP_get_runstate_info` - 获取运行状态信息
+  - `VCPUOP_set_periodic_timer` - 设置周期性定时器
+  - `VCPUOP_stop_periodic_timer` - 停止周期性定时器
+- **需要特权的操作**:
+  - `VCPUOP_initialise` - 初始化 VCPU（通常由 Domain 0 调用）
+  - `VCPUOP_up` - 启动 VCPU
+  - `VCPUOP_down` - 停止 VCPU
+  - `VCPUOP_is_up` - 检查 VCPU 是否运行
+  - `VCPUOP_set_timer` - 设置定时器（某些场景）
+  - `VCPUOP_get_timer` - 获取定时器
+  - `VCPUOP_set_singleshot_timer` - 设置单次定时器
+  - `VCPUOP_stop_singleshot_timer` - 停止单次定时器
+  - `VCPUOP_set_isa_irq` - 设置 ISA IRQ
+  - `VCPUOP_send_nmi` - 发送 NMI
+  - `VCPUOP_get_physid` - 获取物理 ID
+  - `VCPUOP_register_vcpu_time_memory_area` - 注册 VCPU 时间内存区域
+
+#### 6.2.4 信息查询类
+
+**`HYPERVISOR_xen_version`** - 获取 Xen 版本
+- **用途**: 获取 Hypervisor 版本信息
+- **权限**: Domain U 可以使用
+- **功能**:
+  - 获取版本号
+  - 获取编译信息
+  - 获取功能特性
+- **实现**: `xen/xen/common/kernel.c` - `do_xen_version()`
+
+**`HYPERVISOR_vm_assist`** - VM 辅助功能
+- **用途**: 启用/禁用 VM 辅助功能
+- **权限**: Domain U 可以使用
+- **功能**:
+  - 启用/禁用各种 VM 辅助功能
+- **实现**: `xen/xen/common/kernel.c` - `do_vm_assist()`
+
+#### 6.2.5 HVM 特定类
+
+**`HYPERVISOR_hvm_op`** - HVM 操作（部分操作）
+- **用途**: HVM Guest 特定操作
+- **权限**: 部分操作 Domain U 可以使用
+- **Domain U 可用操作**:
+  - `HVMOP_get_param` - 获取 HVM 参数
+  - `HVMOP_set_param` - 设置 HVM 参数（某些参数）
+  - `HVMOP_guest_request_vm_event` - Guest 请求 VM 事件（可能允许用户空间）
+- **需要特权的操作**:
+  - `HVMOP_set_param` - 设置某些敏感参数
+  - 其他管理操作
+- **实现**: `xen/xen/arch/x86/hvm/hypercall.c` - `do_hvm_op()`
+
+#### 6.2.6 其他
+
+**`HYPERVISOR_multicall`** - 批量 Hypercall
+- **用途**: 批量执行多个 hypercall
+- **权限**: Domain U 可以使用
+- **功能**: 在一个 hypercall 中执行多个 hypercall
+- **实现**: `xen/xen/common/multicall.c` - `do_multicall()`
+
+**`HYPERVISOR_dm_op`** - 设备模型操作
+- **用途**: 设备模型操作（IOREQ 服务器等）
+- **权限**: Domain U 可以使用（需要策略允许）
+- **功能**:
+  - 创建 IOREQ 服务器
+  - 映射 I/O 范围
+  - 管理设备模型状态
+- **实现**: `xen/xen/common/dm.c` - `do_dm_op()`
+
+**`HYPERVISOR_hypfs_op`** - Hypervisor 文件系统操作
+- **用途**: 访问 Hypervisor 文件系统
+- **权限**: Domain U 可以使用（只读访问）
+- **功能**: 读取 Hypervisor 文件系统信息
+- **实现**: `xen/xen/common/hypfs.c` - `do_hypfs_op()`
+
+### 6.3 x86 PV 特定 Hypercall（Domain U 可用）
+
+以下 hypercall 仅适用于 x86 PV Guest，Domain U 可以使用：
+
+- **`HYPERVISOR_set_trap_table`** - 设置陷阱表
+- **`HYPERVISOR_mmu_update`** - MMU 更新
+- **`HYPERVISOR_set_gdt`** - 设置 GDT
+- **`HYPERVISOR_stack_switch`** - 栈切换
+- **`HYPERVISOR_set_callbacks`** - 设置回调
+- **`HYPERVISOR_fpu_taskswitch`** - FPU 任务切换
+- **`HYPERVISOR_update_va_mapping`** - 更新虚拟地址映射
+- **`HYPERVISOR_update_descriptor`** - 更新描述符
+- **`HYPERVISOR_set_debugreg`** - 设置调试寄存器
+- **`HYPERVISOR_get_debugreg`** - 获取调试寄存器
+- **`HYPERVISOR_iret`** - 中断返回
+- **`HYPERVISOR_mmuext_op`** - MMU 扩展操作
+- **`HYPERVISOR_set_segment_base`** - 设置段基址
+- **`HYPERVISOR_mca`** - 机器检查架构
+
+### 6.4 权限检查机制
+
+#### 6.4.1 基本权限检查
+
+**CPL 检查**（HVM）:
+```102:130:xen/xen/arch/x86/hvm/hypercall.c
+int hvm_hypercall(struct cpu_user_regs *regs)
+{
+    struct vcpu *curr = current;
+    struct domain *currd = curr->domain;
+    int mode = hvm_guest_x86_mode(curr);
+    unsigned long eax = regs->eax;
+    unsigned int token;
+
+    switch ( mode )
+    {
+    case 8:
+        eax = regs->rax;
+        /* Fallthrough to permission check. */
+    case 4:
+    case 2:
+        if ( currd->arch.monitor.guest_request_userspace_enabled &&
+            eax == __HYPERVISOR_hvm_op &&
+            (mode == 8 ? regs->rdi : regs->ebx) == HVMOP_guest_request_vm_event )
+            break;
+
+        if ( unlikely(hvm_get_cpl(curr)) )
+        {
+    default:
+            regs->rax = -EPERM;
+            return HVM_HCALL_completed;
+        }
+    case 0:
+        break;
+    }
+```
+
+**说明**: HVM Guest 必须在内核模式（CPL=0）才能调用 hypercall。
+
+#### 6.4.2 硬件域检查
+
+**`is_hardware_domain()`** 检查:
+- 用于检查是否为硬件域（通常是 Domain 0）
+- 某些操作（如 PCI 设备管理）需要硬件域权限
+
+#### 6.4.3 XSM/FLASK 权限检查
+
+**XSM (Xen Security Module)** 提供细粒度权限控制:
+- `xsm_sysctl()` - sysctl 权限检查
+- `xsm_domctl()` - domctl 权限检查
+- `xsm_physdev_op()` - physdev_op 权限检查
+- 其他 XSM hook
+
+**FLASK 策略**:
+- Domain 0 在 FLASK 策略中有特殊权限
+- 参见 `xen/tools/flask/policy/modules/dom0.te`
+
+### 6.5 权限总结表
+
+| Hypercall | Domain 0 | Domain U | 说明 |
+|-----------|----------|----------|------|
+| `HYPERVISOR_sysctl` | ✅ | ❌ | 系统管理，仅 Domain 0 |
+| `HYPERVISOR_domctl` | ✅ | ❌ | Domain 管理，仅 Domain 0 |
+| `HYPERVISOR_physdev_op` | ✅ | ⚠️ | 部分操作需要硬件域 |
+| `HYPERVISOR_platform_op` | ✅ | ⚠️ | 部分操作需要特权 |
+| `HYPERVISOR_memory_op` | ✅ | ✅ | 大部分操作 Domain U 可用 |
+| `HYPERVISOR_grant_table_op` | ✅ | ✅ | Domain U 可用 |
+| `HYPERVISOR_event_channel_op` | ✅ | ✅ | Domain U 可用 |
+| `HYPERVISOR_sched_op` | ✅ | ✅ | Domain U 可用 |
+| `HYPERVISOR_vcpu_op` | ✅ | ⚠️ | 部分操作 Domain U 可用 |
+| `HYPERVISOR_console_io` | ✅ | ✅ | Domain U 可用 |
+| `HYPERVISOR_xen_version` | ✅ | ✅ | Domain U 可用 |
+| `HYPERVISOR_hvm_op` | ✅ | ⚠️ | 部分操作 Domain U 可用 |
+| `HYPERVISOR_argo_op` | ✅ | ✅ | Domain U 可用（需策略允许） |
+| `HYPERVISOR_multicall` | ✅ | ✅ | Domain U 可用 |
+| `HYPERVISOR_dm_op` | ✅ | ✅ | Domain U 可用（需策略允许） |
+| `HYPERVISOR_hypfs_op` | ✅ | ✅ | Domain U 可用（只读） |
+
+**图例**:
+- ✅: 可以使用
+- ❌: 不能使用
+- ⚠️: 部分操作可用，部分需要特权
+
+## 七、Hypercall 调用流程
+
+### 7.1 Guest 调用流程
 
 1. Guest 准备参数
 2. 调用 hypercall（通过 INT/SYSCALL/VMCALL/HVC）
