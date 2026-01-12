@@ -1172,29 +1172,719 @@ int hvm_hypercall(struct cpu_user_regs *regs)
 - ❌: 不能使用
 - ⚠️: 部分操作可用，部分需要特权
 
-## 七、Hypercall 调用流程
+## 七、Hypercall 处理流程
 
-### 7.1 Guest 调用流程
+### 7.1 完整处理流程概览
 
+```
+Guest 发起 Hypercall
+    |
+    v
+架构特定入口（汇编）
+    |
+    v
+架构特定处理（C 代码）
+    |
+    v
+权限检查
+    |
+    v
+Hypercall 分发（call_handlers_*）
+    |
+    v
+调用处理函数（do_*）
+    |
+    v
+执行操作
+    |
+    v
+返回结果
+```
+
+### 7.2 Guest 发起 Hypercall
+
+#### 7.2.1 x86 PV Guest
+
+**64-bit PV**:
+- **指令**: `SYSCALL`
+- **入口**: `lstar_enter` (`xen/xen/arch/x86/x86_64/entry.S:255`)
+
+```255:290:xen/xen/arch/x86/x86_64/entry.S
+ENTRY(lstar_enter)
+#ifdef CONFIG_XEN_SHSTK
+        ALTERNATIVE "", "setssbsy", X86_FEATURE_XEN_SHSTK
+#endif
+        push  %rax          /* Guest %rsp */
+        movq  8(%rsp), %rax /* Restore guest %rax */
+        movq  $FLAT_KERNEL_SS,8(%rsp)
+        pushq %r11
+        pushq $FLAT_KERNEL_CS64
+        pushq %rcx
+        pushq $0
+        movl  $TRAP_syscall, EFRAME_entry_vector(%rsp)
+        SAVE_ALL
+
+        GET_STACK_END(14)
+
+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %r14=end, %rdx=0, Clob: abcd */
+        /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
+
+        mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
+        test  %rcx, %rcx
+        jz    .Llstar_cr3_okay
+        movb  $0, STACK_CPUINFO_FIELD(use_pv_cr3)(%r14)
+        mov   %rcx, %cr3
+        /* %r12 is still zero at this point. */
+        mov   %r12, STACK_CPUINFO_FIELD(xen_cr3)(%r14)
+.Llstar_cr3_okay:
+        sti
+
+        movq  STACK_CPUINFO_FIELD(current_vcpu)(%r14), %rbx
+        testb $TF_kernel_mode,VCPU_thread_flags(%rbx)
+        jz    switch_to_kernel
+
+        mov   %rsp, %rdi
+        call  pv_hypercall
+        jmp   test_all_events
+```
+
+**32-bit PV**:
+- **指令**: `INT 0x82`
+- **入口**: `do_entry_int82` (`xen/xen/arch/x86/pv/hypercall.c:182`)
+
+**Hypercall Page**:
+- Xen 在 Guest 内存中写入 hypercall stub
+- Guest 通过 `call hypercall_page + index * 32` 调用
+- 抽象了不同模式的差异
+
+#### 7.2.2 x86 HVM Guest
+
+**Intel HVM**:
+- **指令**: `VMCALL`
+- **VM Exit**: `EXIT_REASON_VMCALL` (`xen/xen/arch/x86/hvm/vmx/vmx.c:4560`)
+
+```4560:4565:xen/xen/arch/x86/hvm/vmx/vmx.c
+    case EXIT_REASON_VMCALL:
+        HVMTRACE_1D(VMMCALL, regs->eax);
+
+        if (hvm_hypercall(regs) == HVM_HCALL_completed)
+            update_guest_eip(); /* Safe: VMCALL */
+        break;
+```
+
+**AMD HVM**:
+- **指令**: `VMMCALL`
+- **VM Exit**: 类似处理
+
+#### 7.2.3 ARM Guest
+
+**ARM64**:
+- **指令**: `HVC #XEN_HYPERCALL_TAG`
+- **异常**: `HSR_EC_HVC64` (`xen/xen/arch/arm/traps.c:1394`)
+
+```1394:1447:xen/xen/arch/arm/traps.c
+static void do_trap_hypercall(struct cpu_user_regs *regs, register_t *nr,
+                              const union hsr hsr)
+{
+    struct vcpu *curr = current;
+
+    if ( hsr.iss != XEN_HYPERCALL_TAG )
+    {
+        gprintk(XENLOG_WARNING, "Invalid HVC imm 0x%x\n", hsr.iss);
+        return inject_undef_exception(regs, hsr);
+    }
+
+    curr->hcall_preempted = false;
+
+    perfc_incra(hypercalls, *nr);
+
+    call_handlers_arm(*nr, HYPERCALL_RESULT_REG(regs), HYPERCALL_ARG1(regs),
+                      HYPERCALL_ARG2(regs), HYPERCALL_ARG3(regs),
+                      HYPERCALL_ARG4(regs), HYPERCALL_ARG5(regs));
+
+#ifndef NDEBUG
+    if ( !curr->hcall_preempted && HYPERCALL_RESULT_REG(regs) != -ENOSYS )
+    {
+        /* Deliberately corrupt parameter regs used by this hypercall. */
+        switch ( hypercall_args[*nr] ) {
+        case 5: HYPERCALL_ARG5(regs) = 0xDEADBEEFU;
+        case 4: HYPERCALL_ARG4(regs) = 0xDEADBEEFU;
+        case 3: HYPERCALL_ARG3(regs) = 0xDEADBEEFU;
+        case 2: HYPERCALL_ARG2(regs) = 0xDEADBEEFU;
+        case 1: /* Don't clobber x0/r0 -- it's the return value */
+        case 0: /* -ENOSYS case */
+            break;
+        default: BUG();
+        }
+        *nr = 0xDEADBEEFU;
+    }
+#endif
+
+    /* Ensure the hypercall trap instruction is re-executed. */
+    if ( curr->hcall_preempted )
+        regs->pc -= 4;  /* re-execute 'hvc #XEN_HYPERCALL_TAG' */
+
+#ifdef CONFIG_IOREQ_SERVER
+    /*
+     * We call ioreq_signal_mapcache_invalidate from do_trap_hypercall()
+     * because the only way a guest can modify its P2M on Arm is via an
+     * hypercall.
+     * Note that sending the invalidation request causes the vCPU to block
+     * until all the IOREQ servers have acknowledged the invalidation.
+     */
+    if ( unlikely(curr->mapcache_invalidate) &&
+         test_and_clear_bool(curr->mapcache_invalidate) )
+        ioreq_signal_mapcache_invalidate();
+#endif
+}
+```
+
+### 7.3 架构特定处理
+
+#### 7.3.1 x86 PV Hypercall 处理
+
+**位置**: `xen/xen/arch/x86/pv/hypercall.c:19`
+
+```19:86:xen/xen/arch/x86/pv/hypercall.c
+static void always_inline
+_pv_hypercall(struct cpu_user_regs *regs, bool compat)
+{
+    struct vcpu *curr = current;
+    unsigned long eax;
+
+    ASSERT(guest_kernel_mode(curr, regs));
+
+    curr->hcall_preempted = false;
+
+    if ( !compat )
+    {
+        unsigned long rdi = regs->rdi;
+        unsigned long rsi = regs->rsi;
+        unsigned long rdx = regs->rdx;
+        unsigned long r10 = regs->r10;
+        unsigned long r8 = regs->r8;
+
+        eax = regs->rax;
+
+        if ( unlikely(tb_init_done) )
+        {
+            unsigned long args[5] = { rdi, rsi, rdx, r10, r8 };
+
+            __trace_hypercall(TRC_PV_HYPERCALL_V2, eax, args);
+        }
+
+        call_handlers_pv64(eax, regs->rax, rdi, rsi, rdx, r10, r8);
+
+        if ( !curr->hcall_preempted && regs->rax != -ENOSYS )
+            clobber_regs(regs, eax, pv, 64);
+    }
+#ifdef CONFIG_PV32
+    else
+    {
+        unsigned int ebx = regs->ebx;
+        unsigned int ecx = regs->ecx;
+        unsigned int edx = regs->edx;
+        unsigned int esi = regs->esi;
+        unsigned int edi = regs->edi;
+
+        eax = regs->eax;
+
+        if ( unlikely(tb_init_done) )
+        {
+            unsigned long args[5] = { ebx, ecx, edx, esi, edi };
+
+            __trace_hypercall(TRC_PV_HYPERCALL_V2, eax, args);
+        }
+
+        curr->hcall_compat = true;
+        call_handlers_pv32(eax, regs->eax, ebx, ecx, edx, esi, edi);
+        curr->hcall_compat = false;
+
+        if ( !curr->hcall_preempted && regs->eax != -ENOSYS )
+            clobber_regs(regs, eax, pv, 32);
+    }
+#endif /* CONFIG_PV32 */
+
+    /*
+     * PV guests use SYSCALL or INT $0x82 to make a hypercall, both of which
+     * have trap semantics.  If the hypercall has been preempted, rewind the
+     * instruction pointer to reexecute the instruction.
+     */
+    if ( curr->hcall_preempted )
+        regs->rip -= 2;
+
+    perfc_incra(hypercalls, eax);
+}
+```
+
+**关键步骤**:
+1. **权限检查**: `ASSERT(guest_kernel_mode(curr, regs))` - 确保在内核模式
+2. **重置标志**: `curr->hcall_preempted = false`
+3. **提取参数**: 从寄存器提取 hypercall 编号和参数
+4. **跟踪**: 如果启用跟踪，记录 hypercall
+5. **分发**: 调用 `call_handlers_pv64()` 或 `call_handlers_pv32()`
+6. **参数清理**: 如果未抢占，清理参数寄存器（调试构建）
+7. **抢占处理**: 如果被抢占，回退指令指针
+
+#### 7.3.2 x86 HVM Hypercall 处理
+
+**位置**: `xen/xen/arch/x86/hvm/hypercall.c:102`
+
+```102:192:xen/xen/arch/x86/hvm/hypercall.c
+int hvm_hypercall(struct cpu_user_regs *regs)
+{
+    struct vcpu *curr = current;
+    struct domain *currd = curr->domain;
+    int mode = hvm_guest_x86_mode(curr);
+    unsigned long eax = regs->eax;
+    unsigned int token;
+
+    switch ( mode )
+    {
+    case 8:
+        eax = regs->rax;
+        /* Fallthrough to permission check. */
+    case 4:
+    case 2:
+        if ( currd->arch.monitor.guest_request_userspace_enabled &&
+            eax == __HYPERVISOR_hvm_op &&
+            (mode == 8 ? regs->rdi : regs->ebx) == HVMOP_guest_request_vm_event )
+            break;
+
+        if ( unlikely(hvm_get_cpl(curr)) )
+        {
+    default:
+            regs->rax = -EPERM;
+            return HVM_HCALL_completed;
+        }
+    case 0:
+        break;
+    }
+
+    if ( (eax & 0x80000000U) && is_viridian_domain(currd) )
+    {
+        int ret;
+
+        /* See comment below. */
+        token = hvmemul_cache_disable(curr);
+
+        ret = viridian_hypercall(regs);
+
+        hvmemul_cache_restore(curr, token);
+
+        return ret;
+    }
+
+    /*
+     * Caching is intended for instruction emulation only. Disable it
+     * for any accesses by hypercall argument copy-in / copy-out.
+     */
+    token = hvmemul_cache_disable(curr);
+
+    curr->hcall_preempted = false;
+
+    if ( mode == 8 )
+    {
+        HVM_DBG_LOG(DBG_LEVEL_HCALL, "hcall%lu(%lx, %lx, %lx, %lx, %lx)",
+                    eax, regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8);
+
+        call_handlers_hvm64(eax, regs->rax, regs->rdi, regs->rsi, regs->rdx,
+                            regs->r10, regs->r8);
+
+        if ( !curr->hcall_preempted && regs->rax != -ENOSYS )
+            clobber_regs(regs, eax, hvm, 64);
+    }
+    else
+    {
+        HVM_DBG_LOG(DBG_LEVEL_HCALL, "hcall%lu(%x, %x, %x, %x, %x)", eax,
+                    regs->ebx, regs->ecx, regs->edx, regs->esi, regs->edi);
+
+        curr->hcall_compat = true;
+        call_handlers_hvm32(eax, regs->eax, regs->ebx, regs->ecx, regs->edx,
+                            regs->esi, regs->edi);
+        curr->hcall_compat = false;
+
+        if ( !curr->hcall_preempted && regs->eax != -ENOSYS )
+            clobber_regs(regs, eax, hvm, 32);
+    }
+
+    hvmemul_cache_restore(curr, token);
+
+    HVM_DBG_LOG(DBG_LEVEL_HCALL, "hcall%lu -> %lx", eax, regs->rax);
+
+    if ( unlikely(curr->mapcache_invalidate) )
+    {
+        curr->mapcache_invalidate = false;
+        ioreq_signal_mapcache_invalidate();
+    }
+
+    perfc_incra(hypercalls, eax);
+
+    return curr->hcall_preempted ? HVM_HCALL_preempted : HVM_HCALL_completed;
+}
+```
+
+**关键步骤**:
+1. **模式检测**: 检测 Guest 运行模式（64-bit/32-bit/16-bit）
+2. **权限检查**: 检查 CPL（Current Privilege Level），必须在内核模式（CPL=0）
+3. **Viridian 检查**: 检查是否为 Viridian（Hyper-V）hypercall
+4. **禁用缓存**: 禁用指令模拟缓存（用于参数复制）
+5. **分发**: 调用 `call_handlers_hvm64()` 或 `call_handlers_hvm32()`
+6. **恢复缓存**: 恢复指令模拟缓存
+7. **Mapcache 失效**: 如果 mapcache 需要失效，发送信号
+
+### 7.4 Hypercall 分发机制
+
+#### 7.4.1 分发函数
+
+Xen 使用自动生成的 `call_handlers_*` 函数进行分发：
+
+- **`call_handlers_pv64()`**: x86 64-bit PV
+- **`call_handlers_pv32()`**: x86 32-bit PV
+- **`call_handlers_hvm64()`**: x86 64-bit HVM
+- **`call_handlers_hvm32()`**: x86 32-bit HVM
+- **`call_handlers_arm()`**: ARM
+
+这些函数由 `scripts/gen_hypercall.awk` 脚本从 `hypercall-defs.c` 生成。
+
+#### 7.4.2 路由表
+
+**位置**: `xen/xen/include/hypercall-defs.c`
+
+路由表定义了每个 hypercall 在不同架构和模式下的处理函数：
+
+```229:298:xen/xen/include/hypercall-defs.c
+table:                             pv32     pv64     hvm32    hvm64    arm
+set_trap_table                     compat   do       -        -        -
+mmu_update                         do:1     do:1     -        -        -
+set_gdt                            compat   do       -        -        -
+stack_switch                       do:2     do:2     -        -        -
+set_callbacks                      compat   do       -        -        -
+fpu_taskswitch                     do       do       -        -        -
+sched_op_compat                    do       do       -        -        dep
+#ifndef CONFIG_PV_SHIM_EXCLUSIVE
+platform_op                        compat   do       compat   do       do
+#endif
+set_debugreg                       do       do       -        -        -
+get_debugreg                       do       do       -        -        -
+update_descriptor                  compat   do       -        -        -
+memory_op                          compat   do       hvm      hvm      do
+multicall                          compat:2 do:2     compat   do       do
+update_va_mapping                  compat   do       -        -        -
+set_timer_op                       compat   do       compat   do       -
+event_channel_op_compat            do       do       -        -        dep
+```
+
+**说明**:
+- **`do`**: 调用 `do_*` 函数
+- **`compat`**: 调用 `compat_*` 函数（兼容模式）
+- **`hvm`**: 调用 `hvm_*` 函数
+- **`dep`**: 已弃用
+- **`-`**: 不支持
+- **`:1`, `:2`**: 优先级（数字越小优先级越高）
+
+#### 7.4.3 处理函数命名
+
+处理函数遵循以下命名规则：
+
+- **PV**: `do_<hypercall_name>()`
+- **HVM**: `hvm_<hypercall_name>()` 或 `do_<hypercall_name>()`
+- **兼容**: `compat_<hypercall_name>()`
+- **ARM**: `do_arm_<hypercall_name>()` 或 `do_<hypercall_name>()`
+
+### 7.5 权限检查
+
+#### 7.5.1 基本权限检查
+
+**PV Guest**:
+- **内核模式**: `ASSERT(guest_kernel_mode(curr, regs))`
+- 必须在 Guest 内核模式才能调用 hypercall
+
+**HVM Guest**:
+- **CPL 检查**: `hvm_get_cpl(curr) == 0`
+- 必须在 CPL=0（内核模式）才能调用 hypercall
+
+**ARM Guest**:
+- **异常级别**: 必须在 EL1（内核模式）
+
+#### 7.5.2 特权检查
+
+某些 hypercall 需要特权域（Domain 0）权限：
+
+- **`HYPERVISOR_sysctl`**: 系统管理操作
+- **`HYPERVISOR_domctl`**: Domain 管理操作
+- **`HYPERVISOR_physdev_op`**: 部分物理设备操作
+
+这些检查在处理函数内部进行。
+
+#### 7.5.3 XSM/FLASK 检查
+
+XSM (Xen Security Module) 提供细粒度权限控制：
+
+- **`xsm_sysctl()`**: sysctl 权限检查
+- **`xsm_domctl()`**: domctl 权限检查
+- **`xsm_physdev_op()`**: physdev_op 权限检查
+
+### 7.6 处理函数执行
+
+#### 7.6.1 参数提取
+
+参数从寄存器中提取：
+
+**x86 64-bit**:
+- **参数 1-5**: RDI, RSI, RDX, R10, R8
+- **返回值**: RAX
+
+**x86 32-bit**:
+- **参数 1-5**: EBX, ECX, EDX, ESI, EDI
+- **返回值**: EAX
+
+**ARM64**:
+- **参数 1-5**: X0, X1, X2, X3, X4
+- **返回值**: X0
+
+**ARM32**:
+- **参数 1-5**: R0, R1, R2, R3, R4
+- **返回值**: R0
+
+#### 7.6.2 Guest 内存访问
+
+Hypercall 参数可能包含指向 Guest 内存的指针：
+
+- **`XEN_GUEST_HANDLE_PARAM()`**: Guest 句柄类型
+- **`copy_from_guest()`**: 从 Guest 内存复制数据
+- **`copy_to_guest()`**: 向 Guest 内存复制数据
+- **`guest_handle_is_null()`**: 检查 Guest 句柄是否为空
+
+#### 7.6.3 错误处理
+
+- **返回值**: 负数表示错误码（如 `-EINVAL`, `-EPERM`）
+- **成功**: 返回 0 或正数
+- **`-ENOSYS`**: Hypercall 未实现或未支持
+
+### 7.7 抢占和延续
+
+#### 7.7.1 Hypercall 抢占
+
+某些 hypercall 可能被抢占（preempted）：
+
+- **`curr->hcall_preempted = true`**: 标记 hypercall 被抢占
+- **指令回退**: 回退指令指针，重新执行 hypercall 指令
+- **延续**: 使用 `hypercall_create_continuation()` 创建延续
+
+#### 7.7.2 延续机制
+
+**位置**: `xen/xen/arch/x86/hypercall.c:26`
+
+```26:99:xen/xen/arch/x86/hypercall.c
+unsigned long hypercall_create_continuation(
+    unsigned int op, const char *format, ...)
+{
+    struct vcpu *curr = current;
+    struct mc_state *mcs = &curr->mc_state;
+    const char *p = format;
+    unsigned long arg;
+    unsigned int i;
+    va_list args;
+
+    curr->hcall_preempted = true;
+
+    va_start(args, format);
+
+    if ( mcs->flags & MCSF_in_multicall )
+    {
+        for ( i = 0; *p != '\0'; i++ )
+            mcs->call.args[i] = NEXT_ARG(p, args);
+    }
+    else
+    {
+        struct cpu_user_regs *regs = guest_cpu_user_regs();
+
+        regs->rax = op;
+
+#ifdef CONFIG_COMPAT
+        if ( !curr->hcall_compat )
+#else
+        if ( true )
+#endif
+        {
+            for ( i = 0; *p != '\0'; i++ )
+            {
+                arg = NEXT_ARG(p, args);
+                switch ( i )
+                {
+                case 0: regs->rdi = arg; break;
+                case 1: regs->rsi = arg; break;
+                case 2: regs->rdx = arg; break;
+                case 3: regs->r10 = arg; break;
+                case 4: regs->r8  = arg; break;
+                case 5: regs->r9  = arg; break;
+                }
+            }
+        }
+        else
+        {
+            for ( i = 0; *p != '\0'; i++ )
+            {
+                arg = NEXT_ARG(p, args);
+                switch ( i )
+                {
+                case 0: regs->rbx = arg; break;
+                case 1: regs->rcx = arg; break;
+                case 2: regs->rdx = arg; break;
+                case 3: regs->rsi = arg; break;
+                case 4: regs->rdi = arg; break;
+                case 5: regs->rbp = arg; break;
+                }
+            }
+        }
+    }
+
+    va_end(args);
+
+    return op;
+```
+
+**用途**: 当 hypercall 需要分多次执行时（如处理大量页面），创建延续以便后续继续执行。
+
+### 7.8 返回机制
+
+#### 7.8.1 返回值设置
+
+返回值通过寄存器返回：
+
+- **x86**: `regs->rax` (64-bit) 或 `regs->eax` (32-bit)
+- **ARM**: `HYPERCALL_RESULT_REG(regs)` (X0/R0)
+
+#### 7.8.2 参数清理（调试构建）
+
+在调试构建中，参数寄存器会被清理（设置为 `0xDEADBEEF`），防止 Guest 依赖参数寄存器保持不变。
+
+#### 7.8.3 返回 Guest
+
+**PV Guest**:
+- 通过 `test_all_events` 检查事件
+- 恢复 Guest 上下文
+- 返回 Guest
+
+**HVM Guest**:
+- 更新 Guest EIP（指令指针）
+- 返回 Guest
+
+**ARM Guest**:
+- 如果被抢占，回退 PC（程序计数器）
+- 返回 Guest
+
+### 7.9 完整流程示例
+
+#### 7.9.1 x86 PV Guest 调用 `HYPERVISOR_memory_op`
+
+```
 1. Guest 准备参数
-2. 调用 hypercall（通过 INT/SYSCALL/VMCALL/HVC）
-3. 进入 Hypervisor
-4. Hypervisor 路由到对应的处理函数
-5. 执行操作
-6. 返回结果给 Guest
+   - RAX = __HYPERVISOR_memory_op
+   - RDI = cmd
+   - RSI = arg (指向 Guest 内存)
 
-### 6.2 Hypervisor 处理流程
+2. Guest 执行 SYSCALL
+   - 触发 VM Exit（PV 使用 trap）
 
-1. **入口**: 架构特定的 hypercall 入口（如 `xen/xen/arch/x86/hypercall.c`）
-2. **路由**: 根据 hypercall 编号路由到处理函数
-3. **权限检查**: XSM/FLASK 权限检查
-4. **执行**: 调用对应的 `do_*` 函数
-5. **返回**: 返回结果给 Guest
+3. 进入 lstar_enter (entry.S)
+   - 保存 Guest 上下文
+   - 设置 Xen 栈
+   - 调用 pv_hypercall()
 
-## 七、参考
+4. pv_hypercall() (hypercall.c)
+   - 检查内核模式
+   - 提取参数
+   - 调用 call_handlers_pv64()
+
+5. call_handlers_pv64() (自动生成)
+   - 根据 hypercall 编号路由
+   - 调用 do_memory_op()
+
+6. do_memory_op() (memory.c)
+   - 权限检查
+   - 从 Guest 内存复制参数
+   - 执行操作
+   - 返回结果
+
+7. 返回 Guest
+   - 设置 RAX = 返回值
+   - 清理参数寄存器（调试构建）
+   - 恢复 Guest 上下文
+   - 返回 Guest
+```
+
+#### 7.9.2 x86 HVM Guest 调用 `HYPERVISOR_hvm_op`
+
+```
+1. Guest 准备参数
+   - RAX = __HYPERVISOR_hvm_op
+   - RDI = cmd
+   - RSI = arg
+
+2. Guest 执行 VMCALL
+   - 触发 VM Exit (EXIT_REASON_VMCALL)
+
+3. VMX 处理 (vmx.c)
+   - 调用 hvm_hypercall()
+
+4. hvm_hypercall() (hypercall.c)
+   - 检查 CPL (必须为 0)
+   - 禁用模拟缓存
+   - 调用 call_handlers_hvm64()
+
+5. call_handlers_hvm64() (自动生成)
+   - 路由到 hvm_hvm_op()
+
+6. hvm_hvm_op() (hvm.c)
+   - 执行 HVM 特定操作
+   - 返回结果
+
+7. 返回 Guest
+   - 更新 Guest EIP
+   - 恢复模拟缓存
+   - 返回 Guest
+```
+
+### 7.10 关键机制总结
+
+#### 7.10.1 权限检查层次
+
+1. **架构层**: 内核模式检查（PV/HVM/ARM）
+2. **Hypercall 层**: 特权域检查（某些 hypercall）
+3. **XSM 层**: 细粒度权限检查（FLASK）
+
+#### 7.10.2 参数处理
+
+1. **提取**: 从寄存器提取参数
+2. **验证**: 验证参数有效性
+3. **复制**: 从 Guest 内存复制数据（如果需要）
+4. **执行**: 执行操作
+5. **返回**: 将结果写回 Guest 内存（如果需要）
+
+#### 7.10.3 错误处理
+
+1. **参数验证**: 检查参数有效性
+2. **权限检查**: 检查调用权限
+3. **操作执行**: 执行操作
+4. **错误返回**: 返回错误码（负数）
+
+#### 7.10.4 性能优化
+
+1. **跟踪**: 可选跟踪支持
+2. **缓存**: HVM 禁用模拟缓存以提高性能
+3. **优先级**: 路由表支持优先级
+4. **抢占**: 支持抢占和延续
+
+## 八、参考
 
 - `xen/xen/include/public/xen.h` - Hypercall 编号定义
 - `xen/xen/include/hypercall-defs.c` - Hypercall 定义和路由
+- `xen/xen/arch/x86/pv/hypercall.c` - x86 PV hypercall 处理
+- `xen/xen/arch/x86/hvm/hypercall.c` - x86 HVM hypercall 处理
+- `xen/xen/arch/arm/traps.c` - ARM hypercall 处理
+- `xen/xen/arch/x86/x86_64/entry.S` - x86 64-bit 入口
 - `xen/docs/guest-guide/x86/hypercall-abi.rst` - Hypercall ABI 文档
 - `xen/xen/include/public/arch-arm.h` - ARM Hypercall 说明
 - [Xen Project Wiki - Hypercalls](https://wiki.xenproject.org/wiki/Hypercall)
