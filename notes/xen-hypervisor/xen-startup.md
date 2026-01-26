@@ -5781,7 +5781,632 @@ handle_raz_wi() 处理
 - **处理方式**: 统一使用 `handle_raz_wi()` 处理
 - **当前状态**: 仅提供基本模拟，不支持实际 Watchpoint 功能
 
-## 十七、参考文档
+## 十七、Xen 命令行配置
+
+### 17.1 概述
+
+Xen Hypervisor 支持通过命令行参数进行配置。命令行参数在启动时解析，可以控制 Xen 的行为、功能启用/禁用、资源分配等。
+
+### 17.2 参数类型
+
+#### 17.2.1 参数类型定义
+
+**位置**: `xen/include/xen/param.h:12-27`
+
+```12:27:xen/xen/include/xen/param.h
+struct kernel_param {
+    const char *name;
+    enum {
+        OPT_STR,
+        OPT_UINT,
+        OPT_BOOL,
+        OPT_SIZE,
+        OPT_CUSTOM,
+        OPT_IGNORE,
+    } type;
+    unsigned int len;
+    union {
+        void *var;
+        int (*func)(const char *);
+    } par;
+};
+```
+
+**参数类型**:
+- **`OPT_STR`**: 字符串参数
+- **`OPT_UINT`**: 整数参数（无符号）
+- **`OPT_BOOL`**: 布尔参数
+- **`OPT_SIZE`**: 大小参数（支持单位后缀）
+- **`OPT_CUSTOM`**: 自定义参数（使用函数处理）
+- **`OPT_IGNORE`**: 忽略参数（用于兼容性）
+
+### 17.3 参数定义宏
+
+#### 17.3.1 基本参数定义宏
+
+**位置**: `xen/include/xen/param.h:46-85`
+
+```46:85:xen/xen/include/xen/param.h
+#define custom_param(_name, _var) \
+    __setup_str __setup_str_##_var[] = _name; \
+    __kparam __setup_##_var = \
+        { .name = __setup_str_##_var, \
+          .type = OPT_CUSTOM, \
+          .par.func = _var }
+#define boolean_param(_name, _var) \
+    __setup_str __setup_str_##_var[] = _name; \
+    __kparam __setup_##_var = \
+        { .name = __setup_str_##_var, \
+          .type = OPT_BOOL, \
+          .len = sizeof(_var) + \
+                 BUILD_BUG_ON_ZERO(sizeof(_var) != sizeof(bool)), \
+          .par.var = &_var }
+#define integer_param(_name, _var) \
+    __setup_str __setup_str_##_var[] = _name; \
+    __kparam __setup_##_var = \
+        { .name = __setup_str_##_var, \
+          .type = OPT_UINT, \
+          .len = sizeof(_var), \
+          .par.var = &_var }
+#define size_param(_name, _var) \
+    __setup_str __setup_str_##_var[] = _name; \
+    __kparam __setup_##_var = \
+        { .name = __setup_str_##_var, \
+          .type = OPT_SIZE, \
+          .len = sizeof(_var), \
+          .par.var = &_var }
+#define string_param(_name, _var) \
+    __setup_str __setup_str_##_var[] = _name; \
+    __kparam __setup_##_var = \
+        { .name = __setup_str_##_var, \
+          .type = OPT_STR, \
+          .len = sizeof(_var), \
+          .par.var = &_var }
+#define ignore_param(_name)                 \
+    __setup_str TEMP_NAME(__setup_str_ign)[] = _name;    \
+    __kparam TEMP_NAME(__setup_ign) =                    \
+        { .name = TEMP_NAME(__setup_str_ign),            \
+          .type = OPT_IGNORE }
+```
+
+**宏说明**:
+- **`custom_param`**: 自定义参数，需要提供处理函数
+- **`boolean_param`**: 布尔参数，支持 `yes/no`、`on/off`、`true/false`、`1/0`
+- **`integer_param`**: 整数参数，支持十进制、十六进制（0x）、八进制（0开头）
+- **`size_param`**: 大小参数，支持单位后缀（K/M/G/T）
+- **`string_param`**: 字符串参数
+- **`ignore_param`**: 忽略参数（用于兼容性）
+
+#### 17.3.2 运行时参数宏
+
+**位置**: `xen/include/xen/param.h:171-185`
+
+```171:185:xen/xen/include/xen/param.h
+#define custom_runtime_param(_name, _var, initfunc) \
+    custom_param(_name, _var); \
+    custom_runtime_only_param(_name, _var, initfunc)
+#define boolean_runtime_param(_name, _var) \
+    boolean_param(_name, _var); \
+    boolean_runtime_only_param(_name, _var)
+#define integer_runtime_param(_name, _var) \
+    integer_param(_name, _var); \
+    integer_runtime_only_param(_name, _var)
+#define size_runtime_param(_name, _var) \
+    size_param(_name, _var); \
+    size_runtime_only_param(_name, _var)
+#define string_runtime_param(_name, _var) \
+    string_param(_name, _var); \
+    string_runtime_only_param(_name, _var)
+```
+
+**说明**:
+- 运行时参数可以通过 Hypervisor Filesystem (HYPFS) 在运行时修改
+- 需要 `CONFIG_HYPFS` 支持
+
+### 17.4 参数解析流程
+
+#### 17.4.1 解析入口
+
+**位置**: `xen/common/kernel.c:215-230`
+
+```215:230:xen/xen/common/kernel.c
+/**
+ *    cmdline_parse -- parses the xen command line.
+ * If CONFIG_CMDLINE is set, it would be parsed prior to @cmdline.
+ * But if CONFIG_CMDLINE_OVERRIDE is set to y, @cmdline will be ignored.
+ */
+void __init cmdline_parse(const char *cmdline)
+{
+    if ( opt_builtin_cmdline[0] )
+    {
+        printk("Built-in command line: %s\n", opt_builtin_cmdline);
+        _cmdline_parse(opt_builtin_cmdline);
+    }
+
+#ifndef CONFIG_CMDLINE_OVERRIDE
+    if ( cmdline == NULL )
+        return;
+
+    safe_strcpy(saved_cmdline, cmdline);
+    _cmdline_parse(cmdline);
+#endif
+}
+```
+
+**解析顺序**:
+1. **内置命令行**: 如果 `CONFIG_CMDLINE` 定义了内置命令行，先解析它
+2. **启动命令行**: 然后解析从引导加载程序传递的命令行
+3. **覆盖选项**: 如果 `CONFIG_CMDLINE_OVERRIDE` 启用，忽略启动命令行
+
+#### 17.4.2 参数解析核心函数
+
+**位置**: `xen/common/kernel.c:68-203`
+
+```68:203:xen/xen/common/kernel.c
+static int parse_params(const char *cmdline, const struct kernel_param *start,
+                        const struct kernel_param *end)
+{
+    char opt[MAX_PARAM_SIZE], *optval, *optkey, *q;
+    const char *p = cmdline, *key;
+    const struct kernel_param *param;
+    int rc, final_rc = 0;
+    bool bool_assert, found;
+
+    for ( ; ; )
+    {
+        /* Skip whitespace. */
+        while ( *p == ' ' )
+            p++;
+        if ( *p == '\0' )
+            break;
+
+        /* Grab the next whitespace-delimited option. */
+        q = optkey = opt;
+        while ( (*p != ' ') && (*p != '\0') )
+        {
+            if ( (q-opt) < (sizeof(opt)-1) ) /* avoid overflow */
+                *q++ = *p;
+            p++;
+        }
+        *q = '\0';
+
+        /* Search for value part of a key=value option. */
+        optval = strchr(opt, '=');
+        if ( optval != NULL )
+        {
+            *optval++ = '\0'; /* nul-terminate the option value */
+            q = strpbrk(opt, "([{<");
+        }
+        else
+        {
+            optval = q;       /* default option value is empty string */
+            q = NULL;
+        }
+
+        /* Boolean parameters can be inverted with 'no-' prefix. */
+        key = optkey;
+        bool_assert = !!strncmp("no-", optkey, 3);
+        if ( !bool_assert )
+            optkey += 3;
+
+        rc = 0;
+        found = false;
+        for ( param = start; param < end; param++ )
+        {
+            // ... 匹配参数并处理 ...
+        }
+
+        if ( rc )
+        {
+            printk("parameter \"%s\" has invalid value \"%s\", rc=%d!\n",
+                    key, optval, rc);
+            final_rc = rc;
+        }
+        if ( !found )
+        {
+            printk("parameter \"%s\" unknown!\n", key);
+            final_rc = -EINVAL;
+        }
+    }
+
+    return final_rc;
+}
+```
+
+**解析步骤**:
+1. **跳过空白**: 跳过前导空格
+2. **提取选项**: 提取空格分隔的选项
+3. **分离键值**: 查找 `=` 符号，分离键和值
+4. **处理布尔**: 检查 `no-` 前缀
+5. **匹配参数**: 在参数表中查找匹配的参数
+6. **处理参数**: 根据参数类型处理值
+7. **错误报告**: 报告无效值或未知参数
+
+#### 17.4.3 参数类型处理
+
+**位置**: `xen/common/kernel.c:139-183`
+
+```139:183:xen/xen/common/kernel.c
+            switch ( param->type )
+            {
+            case OPT_STR:
+                strlcpy(param->par.var, optval, param->len);
+                break;
+            case OPT_UINT:
+                rctmp = assign_integer_param(
+                    param,
+                    simple_strtoll(optval, &s, 0));
+                if ( *s )
+                    rctmp = -EINVAL;
+                break;
+            case OPT_BOOL:
+                rctmp = *optval ? parse_bool(optval, NULL) : 1;
+                if ( rctmp < 0 )
+                    break;
+                if ( !rctmp )
+                    bool_assert = !bool_assert;
+                rctmp = 0;
+                assign_integer_param(param, bool_assert);
+                break;
+            case OPT_SIZE:
+                rctmp = assign_integer_param(
+                    param,
+                    parse_size_and_unit(optval, &s));
+                if ( *s )
+                    rctmp = -EINVAL;
+                break;
+            case OPT_CUSTOM:
+                rctmp = -EINVAL;
+                if ( !bool_assert )
+                {
+                    if ( *optval )
+                        break;
+                    safe_strcpy(opt, "no");
+                    optval = opt;
+                }
+                rctmp = param->par.func(optval);
+                break;
+            case OPT_IGNORE:
+                break;
+            default:
+                BUG();
+                break;
+            }
+```
+
+**处理逻辑**:
+- **OPT_STR**: 直接复制字符串
+- **OPT_UINT**: 解析整数（支持 0x 和 0 前缀）
+- **OPT_BOOL**: 解析布尔值，支持 `no-` 前缀
+- **OPT_SIZE**: 解析大小（支持 K/M/G/T 后缀）
+- **OPT_CUSTOM**: 调用自定义处理函数
+- **OPT_IGNORE**: 忽略参数
+
+### 17.5 参数定义示例
+
+#### 17.5.1 布尔参数示例
+
+**位置**: `xen/common/kernel.c:31-34`
+
+```31:34:xen/xen/common/kernel.c
+#ifdef CONFIG_HAS_DIT
+bool __ro_after_init opt_dit = IS_ENABLED(CONFIG_DIT_DEFAULT);
+boolean_param("dit", opt_dit);
+#endif
+```
+
+**使用方式**:
+- `dit` - 启用
+- `no-dit` - 禁用
+- `dit=yes` - 启用
+- `dit=no` - 禁用
+
+#### 17.5.2 自定义参数示例
+
+**位置**: `xen/xsm/xsm_core.c:58-77`
+
+```58:77:xen/xen/xsm/xsm_core.c
+static int __init cf_check parse_xsm_param(const char *s)
+{
+    if ( !strcmp(s, "dummy") )
+        xsm_bootparam = XSM_BOOTPARAM_DUMMY;
+    else if ( !strcmp(s, "flask") )
+        xsm_bootparam = XSM_BOOTPARAM_FLASK;
+    else if ( !strcmp(s, "silo") )
+        xsm_bootparam = XSM_BOOTPARAM_SILO;
+    else
+        return -EINVAL;
+
+    return 0;
+}
+
+custom_param("xsm", parse_xsm_param);
+```
+
+**使用方式**:
+- `xsm=dummy` - 使用 dummy XSM
+- `xsm=flask` - 使用 Flask XSM
+- `xsm=silo` - 使用 Silo XSM
+
+#### 17.5.3 字符串参数示例
+
+**位置**: `xen/drivers/video/vga.c:51`
+
+```51:51:xen/xen/drivers/video/vga.c
+string_param("vga", opt_vga);
+```
+
+**使用方式**:
+- `vga=ask` - 询问用户
+- `vga=text-80x25` - 文本模式
+- `vga=vesa-1024x768` - VESA 模式
+
+#### 17.5.4 整数参数示例
+
+**位置**: `xen/drivers/video/vesa.c:27`
+
+```27:27:xen/xen/drivers/video/vesa.c
+integer_param("vesa-ram", vram_total);
+```
+
+**使用方式**:
+- `vesa-ram=64` - 64MB
+- `vesa-ram=0x40` - 64MB (十六进制)
+- `vesa-ram=0100` - 64MB (八进制)
+
+#### 17.5.5 大小参数示例
+
+**使用方式**:
+- `dom0_mem=512M` - 512 MiB
+- `dom0_mem=1G` - 1 GiB
+- `dom0_mem=2048K` - 2048 KiB
+
+### 17.6 命令行格式
+
+#### 17.6.1 基本格式
+
+**格式**: `option=value` 或 `option`
+
+**规则**:
+- 参数之间用空格分隔
+- 所有选项和值都是大小写敏感的
+- 布尔参数可以省略值（默认为启用）
+
+**示例**:
+```
+dom0_mem=512M loglvl=all noreboot
+```
+
+#### 17.6.2 布尔参数格式
+
+**启用方式**:
+- `option` - 仅指定选项名
+- `option=yes` / `option=on` / `option=true` / `option=enable` / `option=1`
+
+**禁用方式**:
+- `no-option` - 使用 `no-` 前缀
+- `option=no` / `option=off` / `option=false` / `option=disable` / `option=0`
+
+**示例**:
+```
+noreboot          # 启用 noreboot
+no-noreboot       # 禁用 noreboot
+noreboot=yes      # 启用 noreboot
+noreboot=no       # 禁用 noreboot
+```
+
+#### 17.6.3 整数参数格式
+
+**支持格式**:
+- **十进制**: `123`
+- **十六进制**: `0x7B` 或 `0X7B`
+- **八进制**: `0173` (以 0 开头)
+
+**示例**:
+```
+vesa-ram=64       # 十进制
+vesa-ram=0x40     # 十六进制
+vesa-ram=0100     # 八进制
+```
+
+#### 17.6.4 大小参数格式
+
+**单位后缀**:
+- **`T` 或 `t`**: TiB (2^40)
+- **`G` 或 `g`**: GiB (2^30)
+- **`M` 或 `m`**: MiB (2^20)
+- **`K` 或 `k`**: KiB (2^10)
+- **`B` 或 `b`**: Bytes
+- **无后缀**: 默认为 KiB
+
+**示例**:
+```
+dom0_mem=512M     # 512 MiB
+dom0_mem=1G       # 1 GiB
+dom0_mem=2048K    # 2048 KiB
+dom0_mem=2048     # 2048 KiB (默认)
+```
+
+#### 17.6.5 列表参数格式
+
+**格式**: 逗号分隔的值列表
+
+**示例**:
+```
+cpuid=host,leaf=0x80000001,subleaf=0x0,eax=0x0:0x0
+```
+
+### 17.7 命令行来源
+
+#### 17.7.1 命令行来源
+
+1. **引导加载程序**: GRUB、U-Boot 等传递的命令行
+2. **内置命令行**: 编译时通过 `CONFIG_CMDLINE` 定义
+3. **EFI 变量**: UEFI 系统可以从 EFI 变量读取
+
+#### 17.7.2 x86 架构的命令行处理
+
+**位置**: `xen/arch/x86/setup.c:1032-1044`
+
+```1032:1044:xen/xen/arch/x86/setup.c
+                           loader);
+    if ( (kextra = strstr(cmdline, " -- ")) != NULL )
+    {
+        /*
+         * Options after ' -- ' separator belong to dom0.
+         *  1. Orphan dom0's options from Xen's command line.
+         *  2. Skip all but final leading space from dom0's options.
+         */
+        *kextra = '\0';
+        kextra += 3;
+        while ( kextra[0] == ' ' ) kextra++;
+    }
+    cmdline_parse(cmdline);
+```
+
+**说明**:
+- ` -- ` 分隔符用于分离 Xen 和 Dom0 的命令行
+- ` -- ` 之前的是 Xen 参数
+- ` -- ` 之后的是 Dom0 参数
+
+**示例**:
+```
+dom0_mem=512M loglvl=all -- console=ttyS0 root=/dev/sda1
+```
+
+### 17.8 参数注册机制
+
+#### 17.8.1 参数表组织
+
+**位置**: `xen/include/xen/param.h:32`
+
+```32:32:xen/xen/include/xen/param.h
+extern const struct kernel_param __setup_start[], __setup_end[];
+```
+
+**机制**:
+- 所有参数定义通过 `__initsetup` 段组织
+- 链接器自动收集所有参数定义
+- `__setup_start` 和 `__setup_end` 标记参数表的开始和结束
+
+#### 17.8.2 参数定义宏的实现
+
+**关键属性**:
+- **`__initsetup`**: 参数定义放在 `.init.setup` 段
+- **`__initconst`**: 参数名字符串放在 `.init.rodata` 段
+- **对齐**: 参数结构体按指针大小对齐
+
+### 17.9 配置选项
+
+#### 17.9.1 编译时配置
+
+**`CONFIG_CMDLINE`**:
+- 定义内置命令行
+- 在编译时硬编码到 Xen 镜像中
+
+**`CONFIG_CMDLINE_OVERRIDE`**:
+- 如果启用，忽略引导加载程序传递的命令行
+- 只使用内置命令行
+
+#### 17.9.2 运行时配置
+
+**Hypervisor Filesystem (HYPFS)**:
+- 支持运行时修改某些参数
+- 需要 `CONFIG_HYPFS` 支持
+- 使用 `*_runtime_param` 宏定义的参数
+
+### 17.10 常用参数示例
+
+#### 17.10.1 内存相关
+
+```
+dom0_mem=512M          # Dom0 内存大小
+dom0_max_vcpus=4       # Dom0 最大 vCPU 数
+```
+
+#### 17.10.2 日志相关
+
+```
+loglvl=all             # 日志级别
+console=com1           # 控制台设备
+```
+
+#### 17.10.3 调试相关
+
+```
+noreboot               # 出错时不重启
+watchdog               # 启用看门狗
+```
+
+#### 17.10.4 安全相关
+
+```
+xsm=flask              # XSM 模块
+flask=enforcing        # Flask 模式
+```
+
+### 17.11 源码架构总结
+
+#### 17.11.1 文件组织
+
+```
+Xen 命令行配置架构
+├── 参数定义
+│   └── param.h           # 参数定义宏
+├── 参数解析
+│   └── kernel.c          # 解析核心函数
+├── 参数使用
+│   └── 各模块文件        # 使用 *_param 宏定义参数
+└── 文档
+    └── xen-command-line.pandoc  # 参数文档
+```
+
+#### 17.11.2 关键文件
+
+| 文件 | 功能 |
+|------|------|
+| `include/xen/param.h` | 参数定义宏和数据结构 |
+| `common/kernel.c` | 参数解析核心函数 |
+| `arch/x86/setup.c` | x86 架构的命令行处理 |
+| `arch/arm/setup.c` | ARM 架构的命令行处理 |
+| `docs/misc/xen-command-line.pandoc` | 参数文档 |
+
+#### 17.11.3 参数定义流程
+
+```
+1. 定义变量
+   bool opt_dit = false;
+
+2. 使用宏定义参数
+   boolean_param("dit", opt_dit);
+
+3. 编译时链接器收集
+   __setup_start[] ... __setup_end[]
+
+4. 启动时解析
+   cmdline_parse() → parse_params()
+
+5. 设置变量值
+   opt_dit = true/false
+```
+
+### 17.12 总结
+
+**Xen 命令行配置特点**:
+
+1. **类型丰富**: 支持布尔、整数、字符串、大小、自定义类型
+2. **格式灵活**: 支持多种格式（`option`、`option=value`、`no-option`）
+3. **易于扩展**: 使用宏定义，添加新参数简单
+4. **运行时支持**: 部分参数支持运行时修改（通过 HYPFS）
+5. **文档完善**: 有详细的参数文档
+
+**关键机制**:
+- **参数表**: 通过链接器自动收集参数定义
+- **解析器**: 统一的参数解析函数
+- **类型处理**: 根据参数类型自动处理值
+- **错误处理**: 报告无效值和未知参数
+
+## 十八、参考文档
 
 - [ARM 架构启动流程](./arm-startup-flow.md)
 - [ARM 架构特定启动流程](./arm-arch-specific-startup.md)
