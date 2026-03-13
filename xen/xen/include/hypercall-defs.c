@@ -259,7 +259,7 @@ iret                               compat:1 do:1     -        -        -
 vcpu_op                            compat   do       compat:1 do:1     do
 set_segment_base                   do:2     do:2     -        -        -
 #ifdef CONFIG_PV
-mmuext_op                          compat:2 do:2     compat   do       -
+mmuext_op                          compat:2 do:2     compat   do       do
 #endif
 xsm_op                             compat   do       compat   do       do
 nmi_op                             compat   do       -        -        -

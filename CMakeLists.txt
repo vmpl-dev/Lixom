@@ -10,6 +10,49 @@ set_property(GLOBAL PROPERTY CXX_STANDARD 20)
 
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+# Check OpenSSL version - Lixom requires OpenSSL 3.0+ for Provider API
+# Check if provider.h exists (OpenSSL 3.0+ feature)
+if(NOT EXISTS "${OPENSSL_INCLUDE_DIR}/openssl/provider.h")
+    # Try to get version from OpenSSL::SSL target if available
+    if(TARGET OpenSSL::SSL)
+        get_target_property(OPENSSL_LIB_VERSION OpenSSL::SSL VERSION)
+    endif()
+    
+    # Fallback: try to get version from openssl executable
+    if(NOT OPENSSL_LIB_VERSION)
+        find_program(OPENSSL_EXECUTABLE openssl)
+        if(OPENSSL_EXECUTABLE)
+            execute_process(
+                COMMAND ${OPENSSL_EXECUTABLE} version
+                OUTPUT_VARIABLE OPENSSL_VERSION_OUTPUT
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            string(REGEX MATCH "OpenSSL ([0-9]+\\.[0-9]+\\.[0-9]+)" _ "${OPENSSL_VERSION_OUTPUT}")
+            if(CMAKE_MATCH_1)
+                set(OPENSSL_LIB_VERSION ${CMAKE_MATCH_1})
+            endif()
+        endif()
+    endif()
+    
+    message(FATAL_ERROR "Error: Lixom requires OpenSSL 3.0 or later for Provider API support.\n"
+            "Found OpenSSL version: ${OPENSSL_LIB_VERSION}\n"
+            "The required header file openssl/provider.h is missing.\n\n"
+            "Please install OpenSSL 3.0+ development libraries.\n"
+            "For Ubuntu 20.04, you can use the provided installation script:\n"
+            "  ./install-openssl3.sh\n\n"
+            "Or manually build from source:\n"
+            "  wget https://www.openssl.org/source/openssl-3.0.16.tar.gz\n"
+            "  tar xzf openssl-3.0.16.tar.gz\n"
+            "  cd openssl-3.0.16\n"
+            "  ./config --prefix=/usr/local/openssl-3.0 --openssldir=/usr/local/openssl-3.0\n"
+            "  make -j$(nproc)\n"
+            "  sudo make install\n"
+            "  sudo ldconfig\n\n"
+            "Then set CMAKE_PREFIX_PATH=/usr/local/openssl-3.0 when running cmake:\n"
+            "  cmake -B build -S . -DCMAKE_PREFIX_PATH=/usr/local/openssl-3.0")
+endif()
+
 find_package(Threads REQUIRED)
 
 add_link_options("-znoexecstack")

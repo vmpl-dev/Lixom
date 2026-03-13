@@ -12,6 +12,28 @@
 #include <public/vm_event.h>
 #include <asm/event.h>
 #include <asm/guest_walk.h>
+#include <asm/p2m.h>
+
+int p2m_set_mem_access_single(struct domain *d, struct p2m_domain *p2m,
+                              struct p2m_domain *ap2m, p2m_access_t a,
+                              gfn_t gfn)
+{
+    p2m_type_t t;
+    mfn_t mfn;
+    int rc;
+
+    ASSERT(p2m_is_write_locked(p2m));
+    if ( ap2m )
+        ASSERT(p2m_is_write_locked(ap2m));
+
+    mfn = p2m_get_entry(p2m, gfn, &t, NULL, NULL, NULL);
+    if ( mfn_eq(mfn, INVALID_MFN) || t == p2m_invalid )
+        return -ESRCH;
+
+    p2m->mem_access_enabled = true;
+    rc = p2m_set_entry(p2m, gfn, 1, mfn, t, a);
+    return rc;
+}
 
 static int __p2m_get_mem_access(struct domain *d, gfn_t gfn,
                                 xenmem_access_t *access)
